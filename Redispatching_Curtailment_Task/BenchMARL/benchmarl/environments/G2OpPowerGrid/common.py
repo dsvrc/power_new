@@ -36,7 +36,15 @@ class G2OpPowerGridClass(TaskClass):
         device: DEVICE_TYPING,
     ) -> Callable[[], EnvBase]:
         config = copy.deepcopy(self.config)
-        env_pz = PZMAEnvRecoDNLimit(**config)
+        # `ambient_field` selects the recoverable exogenous NS (see
+        # AmbientField.py). Popped here so the base class never sees it.
+        field_cfg = config.pop("ambient_field", None)
+        if field_cfg:
+            from .AmbientField import AmbientFieldEnv
+            env_pz = AmbientFieldEnv(ambient_field=dict(field_cfg), **config)
+            print(f"[ambient field] {env_pz.field_summary()}")
+        else:
+            env_pz = PZMAEnvRecoDNLimit(**config)
         return lambda: PettingZooWrapper(
             env_pz,
             categorical_actions=False,

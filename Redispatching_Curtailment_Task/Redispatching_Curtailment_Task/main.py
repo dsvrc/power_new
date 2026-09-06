@@ -13,6 +13,7 @@ from BMMAAgent import BMMAAgent
 from evaluate import evaluate
 from ns_opponent import get_preset, PRESETS
 from ns_callback import NSDiagnosticsCallback
+from benchmarl.environments.G2OpPowerGrid.AmbientField import get_field_preset
 
 def cli():
     parser = argparse.ArgumentParser(description="Train some agents.")
@@ -52,6 +53,20 @@ def cli():
                                 intensity over all 22 lines, so hidden-vs-frequent
                                 isolates observability from severity. Verify with
                                 'python ns_opponent.py --smoke-test'. (default: default)""")
+    parser.add_argument('--field', type=str, default="off",
+                        help="""Recoverable exogenous NS: an advecting weather front
+                                modulating line thermal ratings (Dynamic Line Rating).
+                                Mean-zero in space and time, so average capacity is
+                                UNCHANGED and the undisturbed baseline stays reachable
+                                -- unlike --opponent, which removes capacity. Choices:
+                                off, mild, standard, strong, fast. (default: off)""")
+    parser.add_argument('--field_oracle', type=str, default="none",
+                        choices=["none", "local", "full"],
+                        help="""Append the true field to every agent's observation.
+                                'full' is the CEILING arm: gap_B = baseline - oracle is
+                                irreducible, gap_A = oracle - blind is what any method
+                                could win. Run it before building a method.
+                                (default: none)""")
     parser.add_argument('--ns_csv', type=str, default=None,
                         help="""Directory for per-iteration NS diagnostics CSVs, one
                                 per seed. Lets you judge whether MAPPO is failing after
@@ -152,6 +167,13 @@ if __name__ == "__main__":
     print(f"Opponent preset: {args.opponent} -> "
           f"{sorted(task.config['env_g2op_config'].keys()) or 'dataset default'}")
 
+    # Recoverable exogenous NS (advecting DLR field). Seeded per run so the
+    # field realisation is reproducible and identical across arms.
+    field_cfg = get_field_preset(args.field, oracle=args.field_oracle)
+    task.config["ambient_field"] = field_cfg
+    print(f"Ambient field: {args.field} (oracle={args.field_oracle}) -> "
+          f"{'disabled' if field_cfg is None else field_cfg}")
+
     experiment_config.save_folder = os.path.join(ROOT_DIR, "saved_models")
     os.makedirs(experiment_config.save_folder, exist_ok=True)
     experiment_config.checkpoint_at_end = save_experiment # A MASAC checkpoint is 67G
@@ -188,7 +210,11 @@ if __name__ == "__main__":
         callbacks = None
         if ns_csv_dir:
             os.makedirs(ns_csv_dir, exist_ok=True)
-            tag = f"{alg}_{args.opponent}_seed{seed}"
+            # Arm tag drives the CSV filename, which ns_verdict.py groups on.
+            ftag = ("off" if args.field == "off"
+                    else args.field if args.field_oracle == "none"
+                    else f"{args.field}-oracle-{args.field_oracle}")
+            tag = f"{alg}_field-{ftag}_seed{seed}"
             callbacks = [NSDiagnosticsCallback(
                 csv_path=os.path.join(ns_csv_dir, f"{tag}.csv"), run_tag=tag)]
         train_algo(task, algorithm_config, model_config, critic_model_config,

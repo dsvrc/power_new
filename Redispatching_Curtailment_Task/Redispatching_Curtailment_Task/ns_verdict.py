@@ -177,6 +177,29 @@ def verdict(treat, base):
     return flags
 
 
+def gap_decomposition(summaries, baseline, blind, oracle, metric="eplen_tail"):
+    """Split the NS penalty into what no algorithm can recover and what one could.
+
+        gap_B = baseline - oracle   irreducible: the NS genuinely costs performance
+        gap_A = oracle   - blind    recoverable: the price of not knowing
+
+    Reported on episode length by default -- ScoreL2RPN2020 scores ts_survived,
+    and return is confounded with episode length under a per-step reward.
+    """
+    b, l, o = (summaries.get(baseline), summaries.get(blind), summaries.get(oracle))
+    if not (b and l):
+        return None
+    B, L = b[metric], l[metric]
+    out = dict(metric=metric, baseline=B, blind=L, total=B - L)
+    if o:
+        O = o[metric]
+        out.update(oracle=O, gap_B=B - O, gap_A=O - L)
+        tot = B - L
+        if tot and tot == tot and abs(tot) > 1e-9:
+            out["recoverable_frac"] = (O - L) / tot
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -185,6 +208,17 @@ def main():
                     help="opponent preset treated as control (default: off)")
     ap.add_argument("--treatment", default="hidden",
                     help="opponent preset under test (default: hidden)")
+    ap.add_argument("--decompose", nargs=3, metavar=("BASELINE", "BLIND", "ORACLE"),
+                    default=None,
+                    help="three arm names to split the NS penalty into an "
+                         "irreducible part (gap_B) and a recoverable part (gap_A), "
+                         "e.g. --decompose field-off field-standard "
+                         "field-standard-oracle-full")
+    ap.add_argument("--metric", default="eplen_tail",
+                    choices=["eplen_tail", "ret_tail"],
+                    help="metric for the decomposition (default: eplen_tail; "
+                         "ScoreL2RPN2020 scores survival, and return is "
+                         "confounded with episode length)")
     args = ap.parse_args()
 
     paths = sorted(glob.glob(os.path.join(args.csv_dir, "*.csv")))
@@ -194,7 +228,9 @@ def main():
 
     groups = defaultdict(list)
     for p in paths:
-        m = re.match(r".*?_(\w+?)_seed\d+\.csv$", os.path.basename(p))
+        # Arm names carry hyphens (e.g. "field-standard-oracle-full"), so the
+        # character class must include them or every arm collapses to "unknown".
+        m = re.match(r".*?_([\w.-]+?)_seed\d+\.csv$", os.path.basename(p))
         groups[m.group(1) if m else "unknown"].append(p)
 
     print("=" * 78)
@@ -226,6 +262,48 @@ def main():
               f"{fmt(s['deg']):>10}")
     print("\n  critic_ev / return / ep len / sigma are means over the last third")
     print("  of iterations, averaged across seeds.")
+
+    if args.decompose:
+        bn, ln, on = args.decompose
+        d = gap_decomposition(summaries, bn, ln, on, args.metric)
+        print("\n" + "=" * 78)
+        print(f"HOW MUCH OF THE NS IS RECOVERABLE?   (metric: {args.metric})")
+        print("=" * 78)
+        if d is None:
+            have = ", ".join(sorted(summaries)) or "none"
+            print(f"\n  Need at least {bn!r} and {ln!r}. Found: {have}")
+        else:
+            print(f"\n  baseline  {bn:<34} {fmt(d['baseline'],1):>9}")
+            if "oracle" in d:
+                print(f"  oracle    {on:<34} {fmt(d['oracle'],1):>9}")
+            print(f"  blind     {ln:<34} {fmt(d['blind'],1):>9}")
+            print(f"\n  total NS penalty                             "
+                  f"{fmt(d['total'],1):>9}")
+            if "gap_A" in d:
+                print(f"    gap_B  irreducible (baseline - oracle)     "
+                      f"{fmt(d['gap_B'],1):>9}   no algorithm recovers this")
+                print(f"    gap_A  recoverable (oracle - blind)        "
+                      f"{fmt(d['gap_A'],1):>9}   the headroom a method can win")
+                rf = d.get("recoverable_frac", float("nan"))
+                rf_s = "n/a" if rf != rf else f"{100.0 * rf:.1f}%"
+                print(f"\n  RECOVERABLE FRACTION: {rf_s}")
+                print("  " + "-" * 74)
+                if rf == rf and rf > 0.6:
+                    print("  Most of the penalty is information, not physics. This NS is a")
+                    print("  well-posed target: a method that infers the field should close")
+                    print("  most of the gap, and the ceiling is provably reachable.")
+                elif rf == rf and rf > 0.3:
+                    print("  Mixed. Usable, but report gap_B explicitly -- part of what looks")
+                    print("  like an algorithmic failure is the environment being harder.")
+                elif rf == rf:
+                    print("  Mostly irreducible. Lower `amplitude` until gap_B shrinks, or this")
+                    print("  arm measures difficulty rather than non-stationarity -- the same")
+                    print("  problem the opponent preset has.")
+            else:
+                print(f"\n  No oracle arm ({on!r}) found -- cannot split the penalty.")
+                print("  Run with --field_oracle full to measure the ceiling.")
+        print()
+        return
 
     base = summaries.get(args.baseline)
     treat = summaries.get(args.treatment)

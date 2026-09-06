@@ -252,6 +252,16 @@ class PZMAEnvWithHeuristics(PZMultiAgentEnv):
         self._previous_act = g2op_obs_
         # Observations
         gym_obs = self._to_gym_obs(g2op_obs_)
+        # State for the centralised critic.
+        # PZMultiAgentEnv.step sets this, but this class overrides step and used
+        # to omit it, so state() returned the observation captured at reset() for
+        # the whole episode: MAPPO's centralised critic saw a CONSTANT input and
+        # could only ever learn the episode-average return.
+        # _aux_state_space carries obs_attr_to_keep_default, the same attributes
+        # and normalisation as the redispatching agent's space, so this is the
+        # same vector the base class builds -- and it is unaffected by any
+        # per-agent observation augmentation.
+        self._state = self._aux_state_space.to_gym(g2op_obs_)
         # Rewards
         if self.use_global_reward:
             rew = {agent_id: rew_ for agent_id in self.agents}

@@ -53,10 +53,12 @@ _DRIFT_KEYS = ("loss_objective", "loss_critic", "ESS")
 
 
 def _locate_attr(space, attr):
-    """Index range of `attr` inside a grid2op BoxGymnasiumObsSpace vector.
+    """Candidate index range of `attr` inside a grid2op BoxGymnasiumObsSpace.
 
-    grid2op has moved this around between versions, so probe rather than
-    assume; return None and let the caller degrade gracefully.
+    Only a CANDIDATE: the first version of this trusted the answer and produced
+    frac_degraded == 1.0 for every frame of every run, because the slice landed
+    on a normalised integer attribute whose values are all < 0.5.  The caller
+    must validate against real data via _validate_slice.
     """
     if hasattr(space, "get_indexes"):
         try:
@@ -69,12 +71,43 @@ def _locate_attr(space, attr):
     dims = getattr(space, "_dims", None)
     if attrs and dims is not None and attr in attrs:
         try:
+            d = np.asarray(dims, dtype=int)
+            # _dims may be cumulative offsets or per-attribute sizes.
+            cum = d if np.all(np.diff(d) >= 0) and d[0] != d.sum() else np.cumsum(d)
             i = attrs.index(attr)
-            lo = 0 if i == 0 else int(dims[i - 1])
-            return lo, int(dims[i])
+            lo = 0 if i == 0 else int(cum[i - 1])
+            return lo, int(cum[i])
         except Exception:
             pass
     return None
+
+
+def _validate_slice(state, sl, width):
+    """A line_status slice must be `width` wide and binary-valued."""
+    if sl is None or (sl[1] - sl[0]) != width:
+        return False
+    try:
+        v = state[..., sl[0]:sl[1]].reshape(-1)
+        u = torch.unique(v)
+        return bool(u.numel() <= 2 and torch.all((u == 0) | (u == 1)))
+    except Exception:
+        return False
+
+
+def _scan_for_binary_window(state, width):
+    """Last resort: find the one `width`-wide window that is binary-valued."""
+    try:
+        flat = state.reshape(-1, state.shape[-1])
+        n = flat.shape[-1]
+        hits = []
+        for lo in range(0, n - width + 1):
+            v = flat[..., lo:lo + width]
+            u = torch.unique(v)
+            if u.numel() <= 2 and torch.all((u == 0) | (u == 1)):
+                hits.append((lo, lo + width))
+        return hits[0] if len(hits) == 1 else None
+    except Exception:
+        return None
 
 
 def _f(x):
@@ -133,6 +166,8 @@ class NSDiagnosticsCallback(Callback):
         self._t0 = time.time()
         self._state_slice = None
         self._state_slice_tried = False
+        self._state_slice_ok = None
+        self._n_line = None
         self._rows_written = 0
 
     # -- setup ---------------------------------------------------------
@@ -145,6 +180,7 @@ class NSDiagnosticsCallback(Callback):
               f"  (line_status slice: {self._state_slice})")
 
     def _resolve_state_slice(self):
+        """Candidate only; confirmed against real data in _confirm_state_slice."""
         if self._state_slice_tried:
             return
         self._state_slice_tried = True
@@ -153,11 +189,39 @@ class NSDiagnosticsCallback(Callback):
             try:
                 env = getattr(self.experiment, attrpath)
                 pz = env.base_env._env
+                self._n_line = int(pz.env_g2op.n_line)
                 self._state_slice = _locate_attr(pz._aux_state_space, "line_status")
                 if self._state_slice:
                     return
             except Exception:
                 continue
+
+    def _confirm_state_slice(self, batch):
+        """Validate (or repair) the slice once, against a real state tensor."""
+        if self._state_slice_ok is not None:
+            return
+        try:
+            state = batch.get("state")
+        except Exception:
+            self._state_slice_ok = False
+            return
+        width = getattr(self, "_n_line", None)
+        if state is None or not width:
+            self._state_slice_ok = False
+            return
+
+        if _validate_slice(state, self._state_slice, width):
+            self._state_slice_ok = True
+        else:
+            found = _scan_for_binary_window(state, width)
+            if found is not None:
+                print(f"[ns] line_status slice {self._state_slice} failed "
+                      f"validation; using scanned window {found}")
+                self._state_slice, self._state_slice_ok = found, True
+            else:
+                print("[ns] could not locate a binary line_status window in the "
+                      "state vector -- frac_degraded disabled (reported as NaN)")
+                self._state_slice_ok = False
 
     # -- collection ----------------------------------------------------
     def on_batch_collected(self, batch):
@@ -185,12 +249,12 @@ class NSDiagnosticsCallback(Callback):
             row["approx_ep_len"] = float("nan")
 
         # Exogenous exposure of the collected frames.
+        self._confirm_state_slice(batch)
         row["frac_degraded"] = float("nan")
-        if self._state_slice is not None:
+        if self._state_slice_ok:
             try:
                 lo, hi = self._state_slice
                 ls = batch.get("state")[..., lo:hi]
-                # line_status is 0/1 (possibly min-max normalised, same range)
                 row["frac_degraded"] = float((ls < 0.5).any(-1).float().mean().item())
             except Exception:
                 pass
@@ -208,8 +272,44 @@ class NSDiagnosticsCallback(Callback):
 
         vt = _get(batch, group, "value_target")
         sv = _get(batch, group, "state_value")
+
+        # The cached "state_value" came back identically zero in the first run,
+        # which makes EV exactly 0 for every agent and iteration (Var(t-0) ==
+        # Var(t)) and looks like a finding. Recompute from the critic itself.
+        try:
+            loss = self.experiment.losses[group]
+            critic = getattr(loss, "critic_network", None)
+            if critic is not None:
+                with torch.no_grad():
+                    td = batch.clone(False)
+                    critic(td)
+                    sv2 = _get(td, group, "state_value")
+                if sv2 is not None and float(sv2.float().std()) > 0:
+                    sv = sv2
+                    self._row[f"critic_sv_source__{group}"] = "recomputed"
+        except Exception:
+            pass
+
+        # Log the components too, so a degenerate probe is visible next time
+        # rather than being mistaken for a collapsed value function.
+        if vt is not None:
+            self._row[f"value_target_std__{group}"] = float(vt.float().std())
+        if sv is not None:
+            self._row[f"state_value_std__{group}"] = float(sv.float().std())
         if vt is not None and sv is not None:
             self._row[key] = _explained_variance(vt, sv)
+            # Scale-free companion: independent of GAE's internal conventions.
+            try:
+                a = vt.detach().float().reshape(-1)
+                b = sv.detach().float().reshape(-1)
+                n = min(a.numel(), b.numel())
+                a, b = a[:n], b[:n]
+                if a.std() > 0 and b.std() > 0:
+                    self._row[f"critic_corr__{group}"] = float(
+                        ((a - a.mean()) * (b - b.mean())).mean()
+                        / (a.std() * b.std()))
+            except Exception:
+                pass
 
         adv = _get(batch, group, "advantage")
         if adv is not None:
@@ -263,8 +363,10 @@ class NSDiagnosticsCallback(Callback):
     # -- aggregation + IO ----------------------------------------------
     def _finalise_and_write(self):
         row = self._row
-        for prefix in ("critic_ev", "policy_scale", "adv_std", "log_prob",
-                       "loss_critic", "loss_objective", "ESS",
+        for prefix in ("critic_ev", "critic_corr", "policy_scale", "adv_std",
+                       "log_prob", "loss_critic", "loss_objective", "ESS",
+                       "value_target_std", "state_value_std",
+                       "entropy", "clip_fraction", "kl_approx",
                        "drift_loss_objective", "drift_ESS"):
             vals = [v for k, v in row.items()
                     if k.startswith(prefix + "__") and v == v]
