@@ -650,7 +650,9 @@ def main():
                   " skipping counterfactual")
 
     results = {}
+    failures = {}
     intro = None
+    intro_from = None
     for label, extra in conditions:
         for pol in policies:
             print(f"\n--- condition={label}  policy={pol} "
@@ -659,16 +661,32 @@ def main():
                 res, env = run_condition(
                     probe_cls, env_name, extra, label, pol,
                     args.episodes, chronic_ids, args.seed, args.max_steps)
-            except Exception:
-                print(f"  !! condition failed:\n{traceback.format_exc()}")
+            except Exception as exc:
+                tb = traceback.format_exc()
+                print(f"  !! condition failed:\n{tb}")
+                failures[f"{label}::{pol}"] = f"{type(exc).__name__}: {exc}"
                 continue
             results[(label, pol)] = res
-            if intro is None:
+            # Introspect the ON env specifically: reading opponent wiring off an
+            # opponent-disabled env would report the wrong opponent class.
+            if intro is None or (label == "opponent_on" and intro_from != "opponent_on"):
                 intro = introspect_dataset(env_name, env.env_g2op)
+                intro_from = label
             try:
                 env.env_g2op.close()
             except Exception:
                 pass
+
+    if failures:
+        print("\n" + "!" * 78)
+        print("CONDITIONS THAT FAILED TO RUN -- results below are INCOMPLETE")
+        for k, v in failures.items():
+            print(f"  {k}: {v}")
+        if not any(k[0] == "opponent_on" for k in results):
+            print("\n  The opponent-ON condition never ran, so this report says")
+            print("  NOTHING about the preset you asked for. Fix the error above")
+            print("  (try: python ns_opponent.py --smoke-test) and re-run.")
+        print("!" * 78)
 
     if not results:
         print("\nNo condition completed. Nothing to report.")
@@ -700,6 +718,8 @@ def main():
             "seed": args.seed,
         },
         "introspection": intro,
+        "introspection_from_condition": intro_from,
+        "failed_conditions": failures,
         "conditions": {f"{k[0]}::{k[1]}": {kk: vv for kk, vv in v.items()
                                            if not kk.startswith("_")}
                        for k, v in results.items()},
@@ -712,6 +732,9 @@ def main():
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(dump, f, indent=2, default=str)
     print(f"Full results written to {os.path.abspath(args.out)}\n")
+
+    if failures:
+        sys.exit(3)   # non-zero so a failed treatment cannot pass unnoticed
 
 
 if __name__ == "__main__":

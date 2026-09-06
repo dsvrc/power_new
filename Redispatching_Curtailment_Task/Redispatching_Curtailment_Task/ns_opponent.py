@@ -69,10 +69,39 @@ HIDDEN_LINES = [HIDDEN_1, HIDDEN_2, HIDDEN_3]
 BIG_BUDGET = dict(opponent_init_budget=1_000_000.0, opponent_budget_per_ts=100.0)
 
 
+def _check_invariants(every_hour, avg_duration_hour, min_duration_hour,
+                      max_duration_steps):
+    """A geometric attack process is only coherent if the mean gap between
+    attack STARTS exceeds the mean attack DURATION -- otherwise an attack is
+    still running when the next is due and the process is ill-posed.  grid2op
+    rejects such a configuration at env construction time.
+
+    My first version of these presets violated this (every 3h, lasting 4h) and
+    every aggressive preset failed to build.
+    """
+    if not (min_duration_hour <= avg_duration_hour):
+        raise ValueError(
+            f"minimum_attack_duration_hour ({min_duration_hour}) must be <= "
+            f"average_attack_duration_hour ({avg_duration_hour})")
+    if not (avg_duration_hour < every_hour):
+        raise ValueError(
+            f"average_attack_duration_hour ({avg_duration_hour}) must be < "
+            f"attack_every_xxx_hour ({every_hour}); attacks would otherwise "
+            f"overlap themselves. Raise the interval or shorten the duration.")
+    if max_duration_steps < avg_duration_hour * 12:
+        raise ValueError(
+            f"opponent_attack_duration ({max_duration_steps} steps = "
+            f"{max_duration_steps/12:.1f}h) caps the mean duration "
+            f"({avg_duration_hour}h); raise the cap.")
+
+
 def _geometric(lines, every_hour, avg_duration_hour, max_duration_steps,
                min_duration_hour=1, pmax_pmin_ratio=4):
     from grid2op.Action import PowerlineSetAction
     from grid2op.Opponent import GeometricOpponentMultiArea, BaseActionBudget
+
+    _check_invariants(every_hour, avg_duration_hour, min_duration_hour,
+                      max_duration_steps)
 
     cfg = dict(
         opponent_class=GeometricOpponentMultiArea,
@@ -117,22 +146,29 @@ def get_preset(name):
     if name == "off":
         return opponent_off()
 
+    # Per-area duty cycle d ~ avg_duration / interval; with 3 independent areas
+    # the share of steps with >=1 line attacked is ~ 1 - (1-d)^3.  Measured
+    # attack share for 'default' was 11.3% against a naive 17.6%, so scale
+    # estimates by ~0.65 (episodes are short and start un-attacked).
+
     if name == "frequent":
-        # Pure intensity: same 22 lines, ~10x the attack rate, 2x duration.
+        # Pure intensity: same 22 lines. d=0.25 -> ~58% naive, ~37% expected.
         # Isolates "how much" from "how hidden".
-        return _geometric(ALL_LINES, every_hour=3, avg_duration_hour=4,
+        return _geometric(ALL_LINES, every_hour=12, avg_duration_hour=3,
                           max_duration_steps=96)
 
     if name == "hidden":
-        # RECOMMENDED. Intensity AND maximal unobservability: only the 14 lines
-        # visible to exactly one zone agent, so 10/11 agents see nothing.
-        return _geometric(HIDDEN_LINES, every_hour=3, avg_duration_hour=4,
+        # RECOMMENDED. Same intensity as 'frequent' but maximal unobservability:
+        # only the 14 lines visible to exactly one zone agent, so 10/11 agents
+        # see nothing.  Paired with 'frequent' this isolates observability.
+        return _geometric(HIDDEN_LINES, every_hour=12, avg_duration_hour=3,
                           max_duration_steps=96)
 
     if name == "brutal":
-        # Upper bound. Use only if "hidden" still shows no effect.
-        return _geometric(HIDDEN_LINES, every_hour=2, avg_duration_hour=6,
-                          max_duration_steps=144)
+        # Upper bound. d=0.67 -> ~96% naive, ~62% expected. Use only if
+        # 'hidden' shows no effect.
+        return _geometric(HIDDEN_LINES, every_hour=6, avg_duration_hour=4,
+                          max_duration_steps=96)
 
     raise ValueError(f"unknown opponent preset {name!r}; "
                      f"choose from {sorted(PRESETS)}")
@@ -181,5 +217,79 @@ def verify_hidden_set(zones_json_path=None, verbose=True):
     return ok
 
 
+def smoke_test(env_name=None, steps=5):
+    """Actually construct a grid2op env for every preset and report the real
+    exception if one fails.  Settles construction errors in ~1 minute instead of
+    discovering them halfway through a diagnostic run."""
+    import os
+    import traceback
+
+    import grid2op
+    from grid2op.Action import PlayableAction
+    from grid2op.Chronics import Multifolder
+
+    try:
+        from lightsim2grid import LightSimBackend as backend_cls
+    except ImportError:
+        from grid2op.Backend import PandaPowerBackend as backend_cls
+
+    if env_name is None:
+        env_name = os.path.join(grid2op.get_current_local_dir(), "l2rpn_idf_2023")
+
+    print(f"env: {env_name}\n")
+    results = {}
+    for preset in sorted(PRESETS):
+        print(f"--- {preset} ---")
+        try:
+            kw = get_preset(preset)
+        except Exception as exc:
+            print(f"  PRESET INVALID: {type(exc).__name__}: {exc}\n")
+            results[preset] = f"preset error: {exc}"
+            continue
+
+        env = None
+        try:
+            env = grid2op.make(env_name, action_class=PlayableAction,
+                               backend=backend_cls(), chronics_class=Multifolder,
+                               **kw)
+            env.reset()
+            for _ in range(steps):
+                _, _, done, _ = env.step(env.action_space({}))
+                if done:
+                    env.reset()
+            opp = type(getattr(env, "_opponent", None)).__name__
+            print(f"  OK   opponent={opp}")
+            results[preset] = f"ok ({opp})"
+        except Exception as exc:
+            print(f"  FAILED: {type(exc).__name__}: {exc}")
+            print(traceback.format_exc())
+            results[preset] = f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                if env is not None:
+                    env.close()
+            except Exception:
+                pass
+        print()
+
+    print("=" * 70)
+    for k, v in results.items():
+        print(f"  {k:<10} {v}")
+    print("=" * 70)
+    return results
+
+
 if __name__ == "__main__":
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Opponent presets: verify and smoke-test.")
+    ap.add_argument("--smoke-test", action="store_true",
+                    help="build a real grid2op env for every preset and report "
+                         "the actual exception on failure")
+    ap.add_argument("--env", default=None, help="path to the grid2op env folder")
+    a = ap.parse_args()
+
     verify_hidden_set()
+    if a.smoke_test:
+        print()
+        smoke_test(a.env)

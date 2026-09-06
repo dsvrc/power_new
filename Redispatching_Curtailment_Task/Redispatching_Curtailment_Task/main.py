@@ -44,11 +44,14 @@ def cli():
     parser.add_argument('--opponent', type=str, default="default",
                         choices=sorted(PRESETS),
                         help="""Exogenous non-stationarity level. 'default' uses the
-                                dataset's own opponent (~11%% of grid steps attacked,
-                                no measurable effect on survival). 'off' disables it.
-                                'hidden' attacks only lines visible to a single zone
-                                agent at ~10x the rate -- the configuration expected
-                                to break MAPPO. See ns_opponent.py. (default: default)""")
+                                dataset's own opponent (measured: ~11%% of grid steps
+                                attacked, no effect on survival). 'off' disables it.
+                                'hidden' attacks only the 14 lines visible to a single
+                                zone agent, at ~4x the duty cycle -- the configuration
+                                expected to break MAPPO. 'frequent' is the same
+                                intensity over all 22 lines, so hidden-vs-frequent
+                                isolates observability from severity. Verify with
+                                'python ns_opponent.py --smoke-test'. (default: default)""")
     parser.add_argument('--ns_csv', type=str, default=None,
                         help="""Directory for per-iteration NS diagnostics CSVs, one
                                 per seed. Lets you judge whether MAPPO is failing after
