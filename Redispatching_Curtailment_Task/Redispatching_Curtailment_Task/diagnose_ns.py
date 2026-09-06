@@ -78,18 +78,8 @@ def import_env_classes():
 
 def opponent_off_kwargs():
     """grid2op's documented recipe for a genuinely inert opponent."""
-    from grid2op.Action import DontAct
-    from grid2op.Opponent import BaseOpponent, NeverAttackBudget
-
-    return dict(
-        opponent_attack_cooldown=999_999,
-        opponent_attack_duration=0,
-        opponent_budget_per_ts=0.0,
-        opponent_init_budget=0.0,
-        opponent_action_class=DontAct,
-        opponent_class=BaseOpponent,
-        opponent_budget_class=NeverAttackBudget,
-    )
+    from ns_opponent import opponent_off
+    return opponent_off()
 
 
 # --------------------------------------------------------------------------
@@ -605,6 +595,10 @@ def main():
                          "hang. Use this if a run stalls at reset.")
     ap.add_argument("--quick", action="store_true",
                     help="2 episodes, do_nothing only, no counterfactual")
+    ap.add_argument("--opponent", type=str, default="default",
+                    help="opponent preset from ns_opponent.py to measure as the "
+                         "'ON' condition: default, frequent, hidden, brutal "
+                         "(default: default)")
     ap.add_argument("--out", type=str, default="ns_diagnostic.json")
     args = ap.parse_args()
 
@@ -643,7 +637,11 @@ def main():
 
     chronic_ids = None if args.no_pin else list(range(args.episodes))
 
-    conditions = [("opponent_on", {})]
+    from ns_opponent import get_preset
+    on_kwargs = get_preset(args.opponent)
+    print(f"  opponent preset      : {args.opponent} -> "
+          f"{sorted(on_kwargs.keys()) or 'dataset default'}")
+    conditions = [("opponent_on", on_kwargs)]
     if not args.no_counterfactual:
         try:
             conditions.append(("opponent_off", opponent_off_kwargs()))

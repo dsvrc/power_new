@@ -11,6 +11,8 @@ import grid2op
 from utils import ROOT_DIR, G2OP_ENV_DIR, IS_LINUX
 from BMMAAgent import BMMAAgent
 from evaluate import evaluate
+from ns_opponent import get_preset, PRESETS
+from ns_callback import NSDiagnosticsCallback
 
 def cli():
     parser = argparse.ArgumentParser(description="Train some agents.")
@@ -37,11 +39,24 @@ def cli():
     parser.add_argument('--save_experiment', action='store_true', 
                         help="""Whether or not to save the experiment. Note that a MASAC checkpoint
                                 can be heavy because the buffer is also saved in it. (default: False)""")
-    parser.add_argument('--evaluate_agents', action='store_true', 
+    parser.add_argument('--evaluate_agents', action='store_true',
                         help="Whether or not to evaluate the trained agents. (default: False)")
+    parser.add_argument('--opponent', type=str, default="default",
+                        choices=sorted(PRESETS),
+                        help="""Exogenous non-stationarity level. 'default' uses the
+                                dataset's own opponent (~11%% of grid steps attacked,
+                                no measurable effect on survival). 'off' disables it.
+                                'hidden' attacks only lines visible to a single zone
+                                agent at ~10x the rate -- the configuration expected
+                                to break MAPPO. See ns_opponent.py. (default: default)""")
+    parser.add_argument('--ns_csv', type=str, default=None,
+                        help="""Directory for per-iteration NS diagnostics CSVs, one
+                                per seed. Lets you judge whether MAPPO is failing after
+                                ~20 iterations instead of a full run. Set to '' to
+                                disable. (default: <save_folder>/ns_diagnostics)""")
     return parser.parse_args()
 
-def train_algo(task, algorithm_config, model_config, critic_model_config, experiment_config, seed, evaluate_agent):
+def train_algo(task, algorithm_config, model_config, critic_model_config, experiment_config, seed, evaluate_agent, callbacks=None):
         print("Creating experiment...")
         experiment = Experiment(
             task=task,
@@ -50,6 +65,7 @@ def train_algo(task, algorithm_config, model_config, critic_model_config, experi
             critic_model_config=critic_model_config,
             seed=seed,
             config=experiment_config,
+            callbacks=callbacks if callbacks else None,
         )
         print("Starting training...")
         experiment.run()
@@ -79,8 +95,19 @@ if __name__ == "__main__":
         mp.set_start_method("fork", force=True)
 
     args = cli()
-    args_dict = vars(args)
-    n_frames, lr, gamma, frames_per_batch, MAPPO_n_episode, MASAC_n_optimizer_steps, MASAC_train_batch_size, seeds, alg, save_experiment, evaluate_agents = args_dict.values()
+    # Explicit attribute access rather than positional unpacking of
+    # vars(args).values(), so adding a CLI flag cannot silently shift bindings.
+    n_frames = args.n_frames
+    lr = args.lr
+    gamma = args.gamma
+    frames_per_batch = args.frames_per_batch
+    MAPPO_n_episode = args.MAPPO_n_episode
+    MASAC_n_optimizer_steps = args.MASAC_n_optimizer_steps
+    MASAC_train_batch_size = args.MASAC_train_batch_size
+    seeds = args.seeds
+    alg = args.alg
+    save_experiment = args.save_experiment
+    evaluate_agents = args.evaluate_agents
 
     # Loads from "benchmarl/conf/experiment/base_experiment.yaml"
     experiment_config = ExperimentConfig.get_from_yaml() # 
@@ -115,6 +142,13 @@ if __name__ == "__main__":
                 setattr(config, hp, new_hps[hp])
 
 
+    # Exogenous non-stationarity level. Must come after the expes_config loop so
+    # it is not overwritten; env_g2op_config is a straight pass-through to
+    # grid2op.make, and a YAML cannot carry the opponent classes.
+    task.config["env_g2op_config"] = get_preset(args.opponent)
+    print(f"Opponent preset: {args.opponent} -> "
+          f"{sorted(task.config['env_g2op_config'].keys()) or 'dataset default'}")
+
     experiment_config.save_folder = os.path.join(ROOT_DIR, "saved_models")
     os.makedirs(experiment_config.save_folder, exist_ok=True)
     experiment_config.checkpoint_at_end = save_experiment # A MASAC checkpoint is 67G
@@ -142,7 +176,18 @@ if __name__ == "__main__":
     experiment_config.lr = lr
     experiment_config.gamma = gamma
 
+    ns_csv_dir = args.ns_csv
+    if ns_csv_dir is None:
+        ns_csv_dir = os.path.join(experiment_config.save_folder, "ns_diagnostics")
+
     for i, seed in enumerate(seeds):
         print(f"Running experiment {i + 1}/{len(seeds)}.")
-        train_algo(task, algorithm_config, model_config, critic_model_config, experiment_config, seed, evaluate_agents)
+        callbacks = None
+        if ns_csv_dir:
+            os.makedirs(ns_csv_dir, exist_ok=True)
+            tag = f"{alg}_{args.opponent}_seed{seed}"
+            callbacks = [NSDiagnosticsCallback(
+                csv_path=os.path.join(ns_csv_dir, f"{tag}.csv"), run_tag=tag)]
+        train_algo(task, algorithm_config, model_config, critic_model_config,
+                   experiment_config, seed, evaluate_agents, callbacks=callbacks)
         gc.collect()
