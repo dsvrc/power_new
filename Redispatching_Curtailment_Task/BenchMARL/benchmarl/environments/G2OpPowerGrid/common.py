@@ -17,6 +17,11 @@ from benchmarl.environments.common import Task, TaskClass
 
 from .PZMAEnvWithHeuristics import PZMAEnvRecoDNLimit
 
+# Bumped whenever this package gains a feature main.py depends on, so a run
+# against a STALE INSTALL fails loudly at startup instead of silently training
+# the wrong environment. Checked by main.py._require_benchmarl_features().
+G2OP_FEATURES = frozenset({"ambient_field", "state_fix"})
+
 class G2OpPowerGridTask(Task):
 
     MY_POWER_GRID = None

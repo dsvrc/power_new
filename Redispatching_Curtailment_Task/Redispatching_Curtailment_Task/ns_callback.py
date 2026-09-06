@@ -178,6 +178,44 @@ class NSDiagnosticsCallback(Callback):
         self._resolve_state_slice()
         print(f"[ns] diagnostics -> {os.path.abspath(self.csv_path)}"
               f"  (line_status slice: {self._state_slice})")
+        self._probe_critic()
+
+    def _probe_critic(self):
+        """Report the critic's actual input width.
+
+        Measured symptom: state_value_std ~1e-7 against value_target_std ~6-20,
+        i.e. the critic emits a CONSTANT, which pins explained variance at
+        exactly 0 and makes every advantage a centred return. Together with
+        torch's "Initializing zero-element tensors is a no-op" warning at
+        startup, a zero-width critic input is the prime suspect. Print it once
+        so the cause is visible instead of inferred.
+        """
+        try:
+            ss = self.experiment.state_spec
+            print(f"[ns] state_spec = {ss}")
+        except Exception as exc:
+            print(f"[ns] state_spec unavailable: {type(exc).__name__}: {exc}")
+        try:
+            import torch.nn as nn
+            for g in list(self.experiment.train_group_map)[:1]:
+                crit = getattr(self.experiment.losses[g], "critic_network", None)
+                if crit is None:
+                    print(f"[ns] critic[{g}] is None")
+                    continue
+                lins = [m for m in crit.modules() if isinstance(m, nn.Linear)]
+                if lins:
+                    print(f"[ns] critic[{g}] Linear stack: "
+                          f"{[(l.in_features, l.out_features) for l in lins]}")
+                    if lins[0].in_features == 0:
+                        print("[ns] *** CRITIC HAS ZERO INPUT FEATURES -- it can only "
+                              "emit its bias. V(s) is a constant, explained variance "
+                              "is identically 0, and MAPPO is running with no "
+                              "baseline. Fix before interpreting any arm. ***")
+                else:
+                    print(f"[ns] critic[{g}] exposes no Linear layers "
+                          f"({type(crit).__name__})")
+        except Exception as exc:
+            print(f"[ns] critic probe failed: {type(exc).__name__}: {exc}")
 
     def _resolve_state_slice(self):
         """Candidate only; confirmed against real data in _confirm_state_slice."""
