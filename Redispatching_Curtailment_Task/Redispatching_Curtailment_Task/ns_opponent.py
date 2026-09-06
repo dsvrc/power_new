@@ -147,26 +147,27 @@ def get_preset(name):
         return opponent_off()
 
     # Per-area duty cycle d ~ avg_duration / interval; with 3 independent areas
-    # the share of steps with >=1 line attacked is ~ 1 - (1-d)^3.  Measured
-    # attack share for 'default' was 11.3% against a naive 17.6%, so scale
-    # estimates by ~0.65 (episodes are short and start un-attacked).
+    # the share of steps with >=1 line attacked is ~ 1 - (1-d)^3.
 
     if name == "frequent":
-        # Pure intensity: same 22 lines. d=0.25 -> ~58% naive, ~37% expected.
-        # Isolates "how much" from "how hidden".
+        # Pure intensity: same 22 lines, d=0.25. Companion to 'hidden'.
         return _geometric(ALL_LINES, every_hour=12, avg_duration_hour=3,
                           max_duration_steps=96)
 
     if name == "hidden":
-        # RECOMMENDED. Same intensity as 'frequent' but maximal unobservability:
-        # only the 14 lines visible to exactly one zone agent, so 10/11 agents
-        # see nothing.  Paired with 'frequent' this isolates observability.
+        # RECOMMENDED, and MEASURED (diagnose_ns.py, 12 episodes, do-nothing):
+        #   51.6% of grid steps under attack   (vs 11.3% for 'default')
+        #   60.1% of agent decision points degraded (vs 27.9% opponent-off)
+        #   survival 0.47x vs opponent-off, shortened in 10 of 12 episodes
+        #   mean 1.000 of 11 zone agents can see any given attack -- exactly
+        #     one, by construction, so 10 of 11 are blind to every attack
+        #   Zone1, Zone3 and Zone6 observed ZERO attacks across the whole run
         return _geometric(HIDDEN_LINES, every_hour=12, avg_duration_hour=3,
                           max_duration_steps=96)
 
     if name == "brutal":
-        # Upper bound. d=0.67 -> ~96% naive, ~62% expected. Use only if
-        # 'hidden' shows no effect.
+        # Upper bound, d=0.67. 'hidden' already halves survival, so this is
+        # unlikely to be needed and risks leaving no learning signal at all.
         return _geometric(HIDDEN_LINES, every_hour=6, avg_duration_hour=4,
                           max_duration_steps=96)
 
