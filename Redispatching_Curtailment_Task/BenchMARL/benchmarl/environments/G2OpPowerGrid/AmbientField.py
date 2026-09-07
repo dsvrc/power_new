@@ -66,6 +66,7 @@ building any method on top.
 """
 
 import functools
+import os
 
 import numpy as np
 from gymnasium.spaces import Box
