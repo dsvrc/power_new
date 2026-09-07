@@ -207,8 +207,14 @@ def main():
                     help="(b) max allowed relative survival loss (default: 0.10)")
     ap.add_argument("--min_ptdf_change", type=float, default=0.02,
                     help="(c) min relative sensitivity change (default: 0.02)")
-    ap.add_argument("--max_rho", type=float, default=1.0,
-                    help="(a) max rho tolerated right after the switch")
+    ap.add_argument("--max_rho_ratio", type=float, default=1.25,
+                    help="""(a) max rho after the switch, as a MULTIPLE of the
+                            nominal run's own max rho. Absolute thresholds do not
+                            work here: do-nothing already peaks near rho 1.56,
+                            because grid2op tolerates several overflow steps
+                            before tripping. An absolute rho<=1 gate rejected all
+                            90 candidates including ones whose survival exactly
+                            equalled nominal. (default: 1.25)""")
     ap.add_argument("--outside_zones_only", action="store_true", default=True,
                     help="only substations outside every agent zone (the "
                          "'neighbouring TSO' story). Default on.")
@@ -256,13 +262,17 @@ def main():
 
     # -- nominal baseline ---------------------------------------------------
     print("\n--- nominal (no reconfiguration) ---")
-    base = []
+    base, base_rho = [], []
     for c in range(args.n_chronics):
         s, mr, *_ = rollout_do_nothing(env, c, args.steps)
-        base.append(s)
+        base.append(s); base_rho.append(mr)
         print(f"  chronic {c}: do-nothing survived {s} steps (max rho {mr:.3f})")
     base_mean = float(np.mean(base))
+    base_max_rho = float(np.max(base_rho))
+    rho_thr = base_max_rho * args.max_rho_ratio
     print(f"  nominal mean survival = {base_mean:.1f} steps")
+    print(f"  nominal max rho       = {base_max_rho:.3f}  -> safety threshold "
+          f"{rho_thr:.3f} ({args.max_rho_ratio}x nominal)")
 
     # -- screen -------------------------------------------------------------
     rows = []
@@ -311,7 +321,7 @@ def main():
 
     # -- verdict ------------------------------------------------------------
     def passes(r):
-        safe = (not r["illegal"]) and (not r["exceptions"]) and r["max_rho"] <= args.max_rho
+        safe = (not r["illegal"]) and (not r["exceptions"]) and r["max_rho"] <= rho_thr
         benign = r["survival_drop"] == r["survival_drop"] and r["survival_drop"] <= args.max_surv_drop
         potent = r["sensitivity_change"] == r["sensitivity_change"] and \
             r["sensitivity_change"] >= args.min_ptdf_change
@@ -365,8 +375,11 @@ def main():
     out = dict(
         env=env_name,
         nominal_survival=base_mean,
+        nominal_max_rho=base_max_rho,
+        rho_threshold=rho_thr,
         criteria=dict(max_surv_drop=args.max_surv_drop,
-                      min_ptdf_change=args.min_ptdf_change, max_rho=args.max_rho),
+                      min_ptdf_change=args.min_ptdf_change,
+                      max_rho_ratio=args.max_rho_ratio),
         ptdf_source=("ptdf" if ptdf0 is not None else "flow_proxy"),
         n_evaluated=len(rows), n_passing=len(keep),
         screened=keep, all_candidates=rows,
