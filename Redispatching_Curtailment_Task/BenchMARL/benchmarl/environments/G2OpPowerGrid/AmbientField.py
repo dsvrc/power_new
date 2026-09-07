@@ -73,6 +73,98 @@ from gymnasium.spaces import Box
 from .PZMAEnvWithHeuristics import PZMAEnvRecoDNLimit
 
 
+class _PlaneWaveEstimator:
+    """Recover the advecting field from line-rating measurements.
+
+    Each line's CURRENT rating is directly measurable without any privileged
+    access: rho = a_or / limit, so limit = a_or / rho and the field factor is
+    limit / nominal. The hard part is not the present, it is the FUTURE -- which
+    needs the wavevector, and that is what may not be locally identifiable.
+
+    Model, at a fixed time t:   f(x) - 1 = A cos(u.x + psi_t)
+    which is LINEAR in (a, b) for f - 1 = a cos(u.x) + b sin(u.x) once u is
+    fixed. So: grid over candidate wavevectors u, precompute the pseudo-inverse
+    of each candidate's design matrix, and per step the fit is one matvec per
+    candidate. Amplitude A = hypot(a, b), phase psi_t = atan2(-b, a).
+
+    The temporal frequency comes from tracking psi_t: psi advances by -omega per
+    step, so omega is the unwrapped phase rate. Prediction is then
+        f(x, t+h) = 1 + A cos(u.x + psi_t - omega h).
+
+    HONEST CAVEAT on the identifiability claim: a single POINT cannot determine
+    a 2-D wavevector -- that part is exact. But a zone owns ~20-46 lines spread
+    over a fair fraction of a wavelength, so a zone-local fit is ill-conditioned
+    rather than impossible. The separation between `local` and `consensus` is
+    therefore a CONDITIONING argument, not an impossibility proof. Run both and
+    report the difference instead of asserting one.
+    """
+
+    def __init__(self, positions, diag, n_head=24, n_wave=7, warmup=8):
+        self.pos = np.asarray(positions, dtype=float)
+        self.diag = float(diag)
+        self.warmup = int(warmup)
+
+        headings = np.linspace(0.0, np.pi, n_head, endpoint=False)
+        waves = np.geomspace(0.3 * diag, 3.0 * diag, n_wave)
+        self.cands, self._pinv, self._design = [], [], []
+        for L in waves:
+            for th in headings:
+                u = np.array([np.cos(th), np.sin(th)]) * (2.0 * np.pi / L)
+                proj = self.pos @ u
+                X = np.stack([np.cos(proj), np.sin(proj)], axis=1)   # (n, 2)
+                G = X.T @ X + 1e-9 * np.eye(2)
+                self.cands.append((u, L, th))
+                self._design.append(X)
+                self._pinv.append(np.linalg.solve(G, X.T))           # (2, n)
+
+        self.n_seen = 0
+        self.A = 0.0
+        self.psi = 0.0
+        self.omega = 0.0
+        self.best = 0
+        self._psi_hist = []
+
+    def update(self, f_meas):
+        """f_meas: measured rating factor per position. Returns residual RMS."""
+        y = np.asarray(f_meas, dtype=float) - 1.0
+        if not np.all(np.isfinite(y)) or y.size != self.pos.shape[0]:
+            return float("nan")
+
+        best_r, best_i, best_ab = np.inf, 0, (0.0, 0.0)
+        for i, P in enumerate(self._pinv):
+            a, b = P @ y
+            r = float(np.mean((self._design[i] @ np.array([a, b]) - y) ** 2))
+            if r < best_r:
+                best_r, best_i, best_ab = r, i, (a, b)
+
+        a, b = best_ab
+        self.best = best_i
+        self.A = float(np.hypot(a, b))
+        psi = float(np.arctan2(-b, a))
+
+        self._psi_hist.append(psi)
+        if len(self._psi_hist) > 12:
+            self._psi_hist.pop(0)
+        if len(self._psi_hist) >= 3:
+            d = np.diff(np.unwrap(np.asarray(self._psi_hist)))
+            self.omega = float(-np.median(d))          # psi advances by -omega
+        self.psi = psi
+        self.n_seen += 1
+        return float(np.sqrt(best_r))
+
+    def ready(self):
+        return self.n_seen >= self.warmup
+
+    def predict(self, positions, h):
+        """Rating factor at `positions`, h steps ahead."""
+        u = self.cands[self.best][0]
+        proj = np.atleast_2d(positions) @ u
+        return 1.0 + self.A * np.cos(proj + self.psi - self.omega * h)
+
+    def heading_deg(self):
+        return float(np.degrees(self.cands[self.best][2])) % 180.0
+
+
 DEFAULT_FIELD = dict(
     amplitude=0.25,        # +-25% rating swing; DLR literature says 20-40%
     wavelength_frac=1.0,   # wavelength as a fraction of the layout diagonal
@@ -82,6 +174,13 @@ DEFAULT_FIELD = dict(
     seed=0,
     oracle="none",         # 'none' | 'local' | 'full'
     horizons=(0, 12, 24),  # steps ahead exposed by the oracle (0, 1 h, 2 h)
+    # -- anticipatory controller (PACT architecture: host RL untouched) --
+    controller="none",     # 'none' | 'oracle' | 'consensus' | 'local'
+    ctrl_gain=0.5,         # correction per unit of anticipated rho excess
+    ctrl_horizon=12,       # steps ahead to anticipate (12 = 1 h)
+    ctrl_target=0.90,      # rho above which anticipated loading is "excess"
+    ctrl_max_delta=0.5,    # cap on |curtailment correction|
+    ctrl_report_every=5000,
 )
 
 PRESETS = {
@@ -94,14 +193,17 @@ PRESETS = {
 }
 
 
-def get_field_preset(name, oracle="none", **overrides):
+def get_field_preset(name, oracle="none", controller="none", **overrides):
     if name is None or name == "off":
+        if (controller or "none") != "none":
+            raise ValueError("--field_controller needs a field; --field is 'off'")
         return None
     if name not in PRESETS:
         raise ValueError(f"unknown field preset {name!r}; choose from {sorted(PRESETS)}")
     cfg = dict(DEFAULT_FIELD)
     cfg.update(PRESETS[name] or {})
     cfg["oracle"] = oracle
+    cfg["controller"] = controller or "none"
     cfg.update(overrides)
     return cfg
 
@@ -171,6 +273,7 @@ class AmbientFieldEnv(PZMAEnvRecoDNLimit):
 
         self._wrap_env()
         self._apply_field()
+        self._init_controller()
 
     # -- the latent -----------------------------------------------------
     def _draw_latent(self):
@@ -267,6 +370,142 @@ class AmbientFieldEnv(PZMAEnvRecoDNLimit):
                 dtype=base.dtype)
         return self._obs_space_cache[agent_id]
 
+    # -- anticipatory controller ----------------------------------------
+    def _init_controller(self):
+        c = self._fcfg
+        self._ctrl = (c.get("controller") or "none").lower()
+        self._ctrl_gain = float(c.get("ctrl_gain", 0.5))
+        self._ctrl_h = int(c.get("ctrl_horizon", 12))
+        self._ctrl_target = float(c.get("ctrl_target", 0.90))
+        self._ctrl_max = float(c.get("ctrl_max_delta", 0.5))
+        self._ctrl_report = int(c.get("ctrl_report_every", 5000))
+
+        # Which action entries are curtailment: curtail_zone has low 0, storage
+        # and redispatch have low < 0. Derived from the spaces, so it stays
+        # correct if the zone partition changes.
+        self._curt_mask = {}
+        for aid in self.agents:
+            low = np.asarray(self.action_space(aid).low)
+            self._curt_mask[aid] = (low >= 0.0)
+
+        # Lines each agent can sense / is judged on.
+        self._agent_lines = {}
+        for i, zname in enumerate(self.zone_names, start=1):
+            idx = [int(x) for x in self.zones_dict[zname].get("line_large_idx", [])]
+            self._agent_lines[f"agent_{i}"] = np.asarray(idx, dtype=int)
+        if self.use_redispatching_agent:
+            self._agent_lines["redispatching_agent"] = np.arange(self.env_g2op.n_line)
+
+        self._est = None
+        self._est_local = {}
+        if self._ctrl == "consensus":
+            self._est = _PlaneWaveEstimator(self._linepos, self._diag)
+        elif self._ctrl == "local":
+            for aid, idx in self._agent_lines.items():
+                if idx.size >= 6:
+                    self._est_local[aid] = _PlaneWaveEstimator(
+                        self._linepos[idx], self._diag)
+
+        self._ctrl_stats = dict(n=0, n_nonzero=0, dabs=0.0, resid=0.0,
+                                mae=0.0, n_mae=0)
+
+    def _measure_field(self, g2op_obs):
+        """Field factor per line from the observation alone: limit = a_or / rho."""
+        rho = np.asarray(g2op_obs.rho, dtype=float)
+        a_or = np.abs(np.asarray(g2op_obs.a_or, dtype=float))
+        ok = (rho > 1e-6) & (a_or > 1e-6) & np.isfinite(rho) & np.isfinite(a_or)
+        f = np.ones(self.env_g2op.n_line, dtype=float)
+        f[ok] = (a_or[ok] / rho[ok]) / self._nominal[ok]
+        return f, ok
+
+    def _predicted_factor(self, agent_id, lines, h):
+        """Rating factor h steps ahead for `lines`, per the active driver."""
+        if self._ctrl == "oracle":
+            return self._factor_at(self._linepos[lines], self._t + h)
+        if self._ctrl == "consensus":
+            if self._est is not None and self._est.ready():
+                return self._est.predict(self._linepos[lines], h)
+            return None
+        if self._ctrl == "local":
+            e = self._est_local.get(agent_id)
+            if e is not None and e.ready():
+                return e.predict(self._linepos[lines], h)
+            return None
+        return None
+
+    def _controller_delta(self, gym_act_dict):
+        """Anticipatory curtailment correction. Floor property: a zero excess
+        (or an unready estimator) returns the action untouched, byte for byte."""
+        obs = getattr(self, "_previous_act", None)
+        if obs is None:
+            return gym_act_dict
+
+        f_now, ok = self._measure_field(obs)
+        if self._ctrl == "consensus" and self._est is not None:
+            m = ok.copy()
+            r = self._est.update(np.where(m, f_now, 1.0))
+            self._ctrl_stats["resid"] += 0.0 if r != r else r
+        elif self._ctrl == "local":
+            for aid, e in self._est_local.items():
+                idx = self._agent_lines[aid]
+                e.update(np.where(ok[idx], f_now[idx], 1.0))
+
+        # Estimator accuracy against the truth, for reporting only.
+        if self._ctrl in ("consensus", "local"):
+            pred = self._predicted_factor(
+                "agent_1" if self._ctrl == "local" else None,
+                np.arange(self.env_g2op.n_line), self._ctrl_h) \
+                if self._ctrl == "consensus" else None
+            if pred is not None:
+                truth = self._factor_at(self._linepos, self._t + self._ctrl_h)
+                self._ctrl_stats["mae"] += float(np.mean(np.abs(pred - truth)))
+                self._ctrl_stats["n_mae"] += 1
+
+        rho = np.asarray(obs.rho, dtype=float)
+        out = dict(gym_act_dict)
+        for aid, act in gym_act_dict.items():
+            lines = self._agent_lines.get(aid)
+            mask = self._curt_mask.get(aid)
+            if lines is None or mask is None or not mask.any() or lines.size == 0:
+                continue
+            f_h = self._predicted_factor(aid, lines, self._ctrl_h)
+            if f_h is None:
+                continue
+            f_c = np.where(ok[lines], f_now[lines], 1.0)
+            # If flow held constant, rho scales as limit_now / limit_future.
+            rho_pred = rho[lines] * np.clip(f_c, 1e-3, None) / np.clip(f_h, 1e-3, None)
+            excess = float(np.max(rho_pred) - self._ctrl_target)   # MAX: binding line
+            self._ctrl_stats["n"] += 1
+            if excess <= 0.0:
+                continue                                            # exactly blind
+            d = float(np.clip(self._ctrl_gain * excess, 0.0, self._ctrl_max))
+            a = np.array(act, dtype=np.float32, copy=True)
+            a[mask] = np.clip(a[mask] - d, 0.0, 1.0)   # lower curtail = curtail more
+            out[aid] = a
+            self._ctrl_stats["n_nonzero"] += 1
+            self._ctrl_stats["dabs"] += d
+
+        s = self._ctrl_stats
+        if self._ctrl_report and s["n"] and s["n"] % self._ctrl_report < len(self.agents):
+            frac = s["n_nonzero"] / max(1, s["n"])
+            print(f"[field-ctrl pid{os.getpid()}] driver={self._ctrl} "
+                  f"steps={s['n']} delta_nonzero_frac={frac:.3f} "
+                  f"delta_abs={s['dabs']/max(1,s['n_nonzero']):.4f} "
+                  f"pred_mae={(s['mae']/s['n_mae']) if s['n_mae'] else float('nan'):.4f}")
+        return out
+
+    def _from_gym_act(self, gym_act_dict):
+        if getattr(self, "_ctrl", "none") != "none":
+            gym_act_dict = self._controller_delta(gym_act_dict)
+        return super()._from_gym_act(gym_act_dict)
+
+    def controller_stats(self):
+        s = dict(self._ctrl_stats)
+        s["delta_nonzero_frac"] = s["n_nonzero"] / max(1, s["n"])
+        s["delta_abs"] = s["dabs"] / max(1, s["n_nonzero"])
+        s["pred_mae"] = s["mae"] / s["n_mae"] if s["n_mae"] else float("nan")
+        return s
+
     # -- reporting -------------------------------------------------------
     def field_summary(self):
         z = self._z
@@ -277,6 +516,9 @@ class AmbientFieldEnv(PZMAEnvRecoDNLimit):
                     heading_deg=float(np.degrees(z["theta"])) % 360.0,
                     oracle=self._oracle,
                     n_oracle_feats=self._n_oracle,
+                    controller=getattr(self, "_ctrl", "none"),
+                    ctrl_gain=getattr(self, "_ctrl_gain", None),
+                    ctrl_horizon=getattr(self, "_ctrl_h", None),
                     layout_diag=self._diag)
 
 

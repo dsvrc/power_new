@@ -104,6 +104,27 @@ def cli():
                                 irreducible, gap_A = oracle - blind is what any method
                                 could win. Run it before building a method.
                                 (default: none)""")
+    parser.add_argument('--field_controller', type=str, default="none",
+                        choices=["none", "oracle", "consensus", "local"],
+                        help="""Anticipatory curtailment controller, applied in the
+                                env wrapper so the host RL is untouched.
+                                'oracle' uses the true field -- the CEILING TEST: if
+                                this does not beat blind, the field is not actionable
+                                and no estimator will rescue it.
+                                'consensus' estimates the field by pooling every
+                                agent's line-rating measurements.
+                                'local' estimates it from each agent's own zone only
+                                -- the ablation that says whether pooling is needed.
+                                (default: none)""")
+    parser.add_argument('--ctrl_gain', type=float, default=0.5,
+                        help="Curtailment correction per unit anticipated rho excess. "
+                             "Negative flips the sign, which identifies the coupling "
+                             "direction if the positive gain hurts. (default: 0.5)")
+    parser.add_argument('--ctrl_horizon', type=int, default=12,
+                        help="Steps ahead to anticipate; 12 = 1 h. (default: 12)")
+    parser.add_argument('--ctrl_target', type=float, default=0.90,
+                        help="rho above which anticipated loading counts as excess. "
+                             "(default: 0.90, matching safe_max_rho)")
     parser.add_argument('--cpu_frac', type=float, default=0.9,
                         help="""Fraction of usable cores to fill with collection
                                 processes. Detection is affinity/cgroup/SLURM aware.
@@ -232,7 +253,10 @@ if __name__ == "__main__":
 
     # Recoverable exogenous NS (advecting DLR field). Seeded per run so the
     # field realisation is reproducible and identical across arms.
-    field_cfg = get_field_preset(args.field, oracle=args.field_oracle)
+    field_cfg = get_field_preset(
+        args.field, oracle=args.field_oracle, controller=args.field_controller,
+        ctrl_gain=args.ctrl_gain, ctrl_horizon=args.ctrl_horizon,
+        ctrl_target=args.ctrl_target)
     task.config["ambient_field"] = field_cfg
     print(f"Ambient field: {args.field} (oracle={args.field_oracle}) -> "
           f"{'disabled' if field_cfg is None else field_cfg}")
@@ -286,9 +310,11 @@ if __name__ == "__main__":
         if ns_csv_dir:
             os.makedirs(ns_csv_dir, exist_ok=True)
             # Arm tag drives the CSV filename, which ns_verdict.py groups on.
-            ftag = ("off" if args.field == "off"
-                    else args.field if args.field_oracle == "none"
-                    else f"{args.field}-oracle-{args.field_oracle}")
+            ftag = "off" if args.field == "off" else args.field
+            if args.field_oracle != "none":
+                ftag += f"-oracle-{args.field_oracle}"
+            if args.field_controller != "none":
+                ftag += f"-ctrl-{args.field_controller}"
             tag = f"{alg}_field-{ftag}_seed{seed}"
             callbacks = [NSDiagnosticsCallback(
                 csv_path=os.path.join(ns_csv_dir, f"{tag}.csv"), run_tag=tag)]
