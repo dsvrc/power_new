@@ -20,7 +20,7 @@ from .PZMAEnvWithHeuristics import PZMAEnvRecoDNLimit
 # Bumped whenever this package gains a feature main.py depends on, so a run
 # against a STALE INSTALL fails loudly at startup instead of silently training
 # the wrong environment. Checked by main.py._require_benchmarl_features().
-G2OP_FEATURES = frozenset({"ambient_field", "state_fix"})
+G2OP_FEATURES = frozenset({"ambient_field", "state_fix", "reconfig"})
 
 class G2OpPowerGridTask(Task):
 
@@ -44,7 +44,16 @@ class G2OpPowerGridClass(TaskClass):
         # `ambient_field` selects the recoverable exogenous NS (see
         # AmbientField.py). Popped here so the base class never sees it.
         field_cfg = config.pop("ambient_field", None)
-        if field_cfg:
+        reconfig_cfg = config.pop("reconfig", None)
+        if field_cfg and reconfig_cfg:
+            raise ValueError("--field and --reconfig are separate NS mechanisms; "
+                             "enable one at a time so an arm difference stays "
+                             "attributable.")
+        if reconfig_cfg:
+            from .Reconfig import ReconfigEnv
+            env_pz = ReconfigEnv(reconfig=dict(reconfig_cfg), **config)
+            print(f"[reconfig] {env_pz.reconfig_summary()}")
+        elif field_cfg:
             from .AmbientField import AmbientFieldEnv
             env_pz = AmbientFieldEnv(ambient_field=dict(field_cfg), **config)
             print(f"[ambient field] {env_pz.field_summary()}")

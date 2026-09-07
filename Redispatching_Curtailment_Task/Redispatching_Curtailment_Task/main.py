@@ -42,8 +42,9 @@ def _require_benchmarl_features(*needed):
     return benchmarl
 
 
-_require_benchmarl_features("ambient_field", "state_fix")
+_require_benchmarl_features("ambient_field", "state_fix", "reconfig")
 from benchmarl.environments.G2OpPowerGrid.AmbientField import get_field_preset
+from benchmarl.environments.G2OpPowerGrid.Reconfig import get_reconfig_preset
 
 def cli():
     parser = argparse.ArgumentParser(description="Train some agents.")
@@ -97,6 +98,31 @@ def cli():
                                 irreducible, gap_A = oracle - blind is what any method
                                 could win. Run it before building a method.
                                 (default: none)""")
+    parser.add_argument('--reconfig', type=str, default="off",
+                        choices=["off", "conservative", "standard", "aggressive"],
+                        help="""Exogenous substation reconfiguration -- a busbar
+                                split by a neighbouring operator. Redistributes
+                                flows WITHOUT removing capacity, so unlike --field
+                                it changes which action is optimal without changing
+                                how binding the constraint is. Every configuration
+                                is pre-screened by screen_topology.py for benignness,
+                                which is what makes it recoverable. Tiers:
+                                conservative (0% survival cost), standard,
+                                aggressive. (default: off)""")
+    parser.add_argument('--reconfig_oracle', type=str, default="none",
+                        choices=["none", "full"],
+                        help="""'full' puts the true bus assignments in every agent's
+                                observation -- the CEILING arm. Run it before any
+                                method: recoverable fraction is
+                                (oracle - blind)/(no-NS - blind), and it must clear
+                                0.8 or the NS is not worth building on.
+                                (default: none)""")
+    parser.add_argument('--reconfig_interval', type=int, default=100,
+                        help="Mean steps between reconfiguration events. (default: 100)")
+    parser.add_argument('--reconfig_n_active', type=int, default=2,
+                        help="Substations allowed off-nominal at once. (default: 2)")
+    parser.add_argument('--reconfig_screen', type=str, default=None,
+                        help="Path to topology_screen.json. (default: search cwd)")
     parser.add_argument('--field_controller', type=str, default="none",
                         choices=["none", "oracle", "consensus", "local"],
                         help="""Anticipatory curtailment controller, applied in the
@@ -228,6 +254,16 @@ if __name__ == "__main__":
     print(f"Ambient field: {args.field} (oracle={args.field_oracle}) -> "
           f"{'disabled' if field_cfg is None else field_cfg}")
 
+    # Exogenous reconfiguration NS. Screened for benignness by
+    # screen_topology.py, which is what makes it recoverable.
+    reconfig_cfg = get_reconfig_preset(
+        args.reconfig, oracle=args.reconfig_oracle,
+        interval_steps=args.reconfig_interval, n_active=args.reconfig_n_active,
+        screen_path=args.reconfig_screen)
+    task.config["reconfig"] = reconfig_cfg
+    print(f"Reconfiguration: {args.reconfig} (oracle={args.reconfig_oracle}) -> "
+          f"{'disabled' if reconfig_cfg is None else reconfig_cfg}")
+
     experiment_config.save_folder = os.path.join(ROOT_DIR, "saved_models")
     os.makedirs(experiment_config.save_folder, exist_ok=True)
     experiment_config.checkpoint_at_end = save_experiment # A MASAC checkpoint is 67G
@@ -266,6 +302,10 @@ if __name__ == "__main__":
             os.makedirs(ns_csv_dir, exist_ok=True)
             # Arm tag drives the CSV filename, which ns_verdict.py groups on.
             ftag = "off" if args.field == "off" else args.field
+            if args.reconfig != "off":
+                ftag = f"reconfig-{args.reconfig}"
+                if args.reconfig_oracle != "none":
+                    ftag += f"-oracle-{args.reconfig_oracle}"
             if args.field_oracle != "none":
                 ftag += f"-oracle-{args.field_oracle}"
             if args.field_controller != "none":
