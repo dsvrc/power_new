@@ -79,21 +79,44 @@ def make_env(env_name):
                         backend=backend_cls(), chronics_class=Multifolder)
 
 
-def max_relief_action(env, obs):
-    """The strongest loading-reducing action the joint action set allows.
+def candidate_actions(env, obs, curtail_margin=30):
+    """A SEARCH over the action set, not one guess at the best action.
 
-    Curtail every renewable to zero and drive every storage to full discharge.
-    This is an UPPER BOUND on what any policy -- blind, oracle, or optimal --
-    could do at this state, which is exactly what the bound needs.
+    The first version used a single "maximum relief" action -- every renewable
+    curtailed to zero, every storage at full discharge -- and it failed twice:
+
+      * it measured delta < 0, i.e. it made loading WORSE. Curtailment only
+        relieves a line if the zone is exporting through it; in an importing
+        zone it raises imports and loads the line harder. Without a PTDF there
+        is no way to know the sign a priori, so the direction has to be
+        SEARCHED rather than assumed.
+      * being that extreme, it diverged the simulated power flow, so `done` came
+        back True and 117 of 120 sampled states were discarded.
+
+    Every candidate is passed through limit_curtail_storage exactly as
+    PZMAEnvRecoDNLimit.fix_action does, so the reachable set measured here is
+    the one training actually executes.
     """
-    d = {}
     ren = np.where(env.gen_renewable)[0]
-    if ren.size:
-        d["curtail"] = [(int(g), 0.0) for g in ren]
+    out = [("do_nothing", env.action_space({}))]
+    for lvl in (0.0, 0.25, 0.5, 0.75):
+        if ren.size:
+            out.append((f"curtail@{lvl}",
+                        env.action_space({"curtail": [(int(g), lvl) for g in ren]})))
     if env.n_storage:
-        d["set_storage"] = [(int(s), float(-env.storage_max_p_prod[s]))
-                            for s in range(env.n_storage)]
-    return env.action_space(d)
+        pmax = env.storage_max_p_prod
+        for name, sign in (("stor_discharge", -1.0), ("stor_charge", +1.0)):
+            out.append((name, env.action_space(
+                {"set_storage": [(int(s), sign * float(pmax[s]))
+                                 for s in range(env.n_storage)]})))
+    fixed = []
+    for name, a in out:
+        try:
+            a.limit_curtail_storage(obs, margin=curtail_margin)
+        except Exception:
+            pass
+        fixed.append((name, a))
+    return fixed
 
 
 def _max_rho(sim_obs):
@@ -105,58 +128,93 @@ def _max_rho(sim_obs):
         return float("nan")
 
 
-def measure_state(env, obs, ns_kind, ns_arg, safe_max_rho):
-    """Return (rho0, delta, Delta) at this state, or None if unusable."""
+def measure_state(env, obs, ns_kind, ns_arg, safe_max_rho, reasons):
+    """Return (rho0, delta, Delta, best) at this state, or None if unusable.
+
+    Both quantities are ACTION EFFECTS measured at the same one-step horizon
+    against the same do-nothing baseline, so neither is contaminated by the
+    grid's own evolution:
+
+        baseline = max rho after do-nothing
+        delta    = baseline - min over candidate actions of max rho   (>= 0,
+                   because do_nothing is itself a candidate)
+        Delta    = max rho under the NS - baseline
+    """
     rho0 = _max_rho(obs)
     if not np.isfinite(rho0):
+        reasons["bad_rho"] += 1
         return None
 
-    # -- delta: how far back can the actuators pull the binding constraint --
-    try:
-        sim, _, done, _ = obs.simulate(max_relief_action(env, obs))
-        if done:
-            return None
-        delta = rho0 - _max_rho(sim)
-    except Exception:
-        return None
-
-    # -- Delta: how far does the NS push it, action held fixed --------------
     dn = env.action_space({})
-    if ns_kind == "field":
-        # Ratings scale by f, so rho scales by 1/f. Worst case over the cycle
-        # is the trough f = 1 - A.
-        f = 1.0 - float(ns_arg)
-        try:
-            sim0, _, done, _ = obs.simulate(dn)
-            if done:
-                return None
-            base = _max_rho(sim0)
-        except Exception:
+    try:
+        sim0, _, d0, _ = obs.simulate(dn)
+        if d0:
+            reasons["baseline_done"] += 1
             return None
-        Delta = base * (1.0 / max(f, 1e-3) - 1.0)
+        baseline = _max_rho(sim0)
+    except Exception:
+        reasons["baseline_raised"] += 1
+        return None
+    if not np.isfinite(baseline):
+        reasons["bad_rho"] += 1
+        return None
+
+    # -- delta: search the action set; a failing candidate is SKIPPED, never
+    #    a reason to discard the state (that is what threw away 117 of 120).
+    best_rho, best_name, n_ok = baseline, "do_nothing", 0
+    for name, a in candidate_actions(env, obs):
+        try:
+            sim, _, done, _ = obs.simulate(a)
+            if done:
+                reasons["cand_done"] += 1
+                continue
+            r = _max_rho(sim)
+            if not np.isfinite(r):
+                continue
+            n_ok += 1
+            if r < best_rho:
+                best_rho, best_name = r, name
+        except Exception:
+            reasons["cand_raised"] += 1
+            continue
+    if n_ok == 0:
+        reasons["no_candidate"] += 1
+        return None
+    delta = baseline - best_rho
+
+    # -- Delta: how far the NS pushes the constraint, action held fixed ------
+    if ns_kind == "field":
+        # Ratings scale by f, so rho scales by 1/f; the trough is f = 1 - A.
+        f = 1.0 - float(ns_arg)
+        Delta = baseline * (1.0 / max(f, 1e-3) - 1.0)
     elif ns_kind == "reconfig":
         sub, cfg = ns_arg
         try:
             act = env.action_space(
                 {"set_bus": {"substations_id": [(int(sub), np.asarray(cfg, int))]}})
-            sim0, _, d0, _ = obs.simulate(dn)
             sim1, _, d1, _ = obs.simulate(act)
-            if d0:
+            if d1:
+                reasons["ns_done"] += 1
                 return None
-            Delta = _max_rho(sim1) - _max_rho(sim0)
+            Delta = _max_rho(sim1) - baseline
         except Exception:
+            reasons["ns_raised"] += 1
             return None
     else:
         return None
 
     if not (np.isfinite(delta) and np.isfinite(Delta)):
+        reasons["bad_rho"] += 1
         return None
-    return rho0, float(delta), float(Delta)
+    return rho0, float(delta), float(Delta), best_name
 
 
 def run(env, ns_kind, ns_args, n_chronics, steps, every, safe_max_rho, label):
-    rows = []
+    import collections
+    rows, reasons = [], collections.Counter()
+    best_counts = collections.Counter()
     dn = env.action_space({})
+    attempted = 0
     for c in range(n_chronics):
         try:
             env.set_id(c)
@@ -165,16 +223,23 @@ def run(env, ns_kind, ns_args, n_chronics, steps, every, safe_max_rho, label):
         obs = env.reset()
         for t in range(steps):
             if t % every == 0:
+                attempted += 1
                 arg = (ns_args if ns_kind == "field"
                        else ns_args[np.random.randint(len(ns_args))])
-                m = measure_state(env, obs, ns_kind, arg, safe_max_rho)
+                m = measure_state(env, obs, ns_kind, arg, safe_max_rho, reasons)
                 if m is not None:
-                    rho0, d, D = m
+                    rho0, d, D, best = m
+                    best_counts[best] += 1
                     rows.append(dict(rho0=rho0, delta=d, Delta=D,
                                      consulted=bool(rho0 > safe_max_rho)))
             obs, _, done, _ = env.step(dn)
             if done:
                 break
+    print(f"\n  [{label}] {len(rows)}/{attempted} states usable"
+          + (f"  rejected: {dict(reasons)}" if reasons else ""))
+    if best_counts:
+        top = ", ".join(f"{k}:{v}" for k, v in best_counts.most_common(4))
+        print(f"  best relief action was  {top}")
     return summarise(rows, label)
 
 
