@@ -99,7 +99,7 @@ def cli():
                                 could win. Run it before building a method.
                                 (default: none)""")
     parser.add_argument('--reconfig', type=str, default="off",
-                        choices=["off", "conservative", "standard", "aggressive"],
+                        choices=["off", "conservative", "standard", "aggressive", "signflip"],
                         help="""Exogenous substation reconfiguration -- a busbar
                                 split by a neighbouring operator. Redistributes
                                 flows WITHOUT removing capacity, so unlike --field
@@ -107,7 +107,10 @@ def cli():
                                 how binding the constraint is. Every configuration
                                 is pre-screened by screen_topology.py for benignness,
                                 which is what makes it recoverable. Tiers:
-                                conservative (0% survival cost), standard,
+                                signflip (RECOMMENDED -- recoverable by
+                                construction: near-zero constraint displacement
+                                plus reversed control-authority signs; needs
+                                screen_signflip.py), conservative, standard,
                                 aggressive. (default: off)""")
     parser.add_argument('--reconfig_oracle', type=str, default="none",
                         choices=["none", "full"],

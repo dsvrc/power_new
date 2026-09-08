@@ -63,12 +63,27 @@ from .PZMAEnvWithHeuristics import PZMAEnvRecoDNLimit
 
 DEFAULT_SCREEN = "topology_screen.json"
 
+DEFAULT_SIGNFLIP = "signflip_screen.json"
+
 # tier -> (max survival drop, min sensitivity change)
+#
+# These three select on FLOW REDISTRIBUTION MAGNITUDE, which authority.py showed
+# is correlated with constraint displacement Delta -- i.e. they select for the
+# very thing that destroys recoverability. Measured: the `standard` tier gave
+# Delta = 0.106 against an actuator reach of 0.03, so kappa = 0.02, and its
+# oracle arm finished 8% BELOW blind at 1M frames. Kept for the ablation that
+# reproduces that failure; do not build on them.
 TIERS = {
     "conservative": (0.00, 0.02),   # measured: 10 configs, zero survival cost
-    "standard":     (0.02, 0.05),   # measured: 8 configs
+    "standard":     (0.02, 0.05),   # measured: 8 configs, kappa 0.02
     "aggressive":   (0.10, 0.02),   # measured: 22 configs
 }
+
+# The tier that is recoverable BY CONSTRUCTION: small Delta (the grid is no
+# harder) plus flipped control-authority signs (your lever works backwards).
+# An oracle knowing the current signs matches no-NS, so gap_B = 0 definitionally
+# rather than by screening luck. Built by screen_signflip.py.
+SIGNFLIP_TIER = "signflip"
 
 DEFAULT_RECONFIG = dict(
     tier="standard",
@@ -97,6 +112,36 @@ def _find_screen(path):
         "screened set is what makes this NS recoverable, and using unscreened "
         "reconfigurations would reproduce the DLR field's failure. Looked in: "
         + ", ".join(str(c) for c in cands if c))
+
+
+def load_signflip(screen_path=None, verbose=True):
+    """The sign-flip set: Delta ~ 0 and control-authority signs reversed."""
+    p = _find_screen(screen_path or DEFAULT_SIGNFLIP)
+    with open(p, "r", encoding="utf-8") as f:
+        d = json.load(f)
+    keep = d.get("screened") or []
+    if not keep:
+        raise RuntimeError(
+            f"{p} contains no passing configuration. Run screen_signflip.py and "
+            f"read its two per-criterion counts -- if none has small |Delta|, "
+            f"this task cannot host a recoverable NS by reconfiguration and the "
+            f"route is raising actuator authority instead.")
+    out = [dict(sub_id=int(c["sub_id"]),
+                config=np.asarray(c["config"], dtype=int),
+                drop=float(c.get("survival_drop") or 0.0),
+                sens=float(c.get("flip_rate", 0.0)),
+                delta_rho=float(c.get("delta_rho", float("nan")))) for c in keep]
+    if verbose:
+        subs = sorted({k["sub_id"] for k in out})
+        print(f"[reconfig] tier=signflip -> {len(out)} configs over {len(subs)} "
+              f"substations {subs}")
+        print(f"[reconfig]   |Delta|   median "
+              f"{np.median([k['delta_rho'] for k in out]):.4f} rho-units "
+              f"(actuator reach ~0.03 -> kappa >= 1)")
+        print(f"[reconfig]   flip rate median "
+              f"{100*np.median([k['sens'] for k in out]):.0f}% of agents")
+        print(f"[reconfig]   screen file    {p}")
+    return out, d
 
 
 def load_screened(tier="standard", screen_path=None, verbose=True):
@@ -160,7 +205,10 @@ class ReconfigEnv(PZMAEnvRecoDNLimit):
         cfg.update(reconfig or {})
         self._rcfg = cfg
 
-        self._pool, _meta = load_screened(cfg["tier"], cfg.get("screen_path"))
+        if cfg["tier"] == SIGNFLIP_TIER:
+            self._pool, _meta = load_signflip(cfg.get("screen_path"))
+        else:
+            self._pool, _meta = load_screened(cfg["tier"], cfg.get("screen_path"))
         self._subs = sorted({c["sub_id"] for c in self._pool})
         self._by_sub = {s: [c for c in self._pool if c["sub_id"] == s]
                         for s in self._subs}
@@ -306,8 +354,9 @@ def get_reconfig_preset(tier, oracle="none", **overrides):
         if (oracle or "none") != "none":
             raise ValueError("--reconfig_oracle needs --reconfig != off")
         return None
-    if tier not in TIERS:
-        raise ValueError(f"unknown tier {tier!r}; choose from {sorted(TIERS)}")
+    if tier != SIGNFLIP_TIER and tier not in TIERS:
+        raise ValueError(f"unknown tier {tier!r}; choose from "
+                         f"{sorted(TIERS) + [SIGNFLIP_TIER]}")
     cfg = dict(DEFAULT_RECONFIG)
     cfg["tier"] = tier
     cfg["oracle"] = oracle or "none"
